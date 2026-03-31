@@ -259,8 +259,8 @@ type VerifierCacheKey = (u64, spiffe::TrustDomain);
 
 #[derive(Clone)]
 struct ServerVerifierCacheValue {
-    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
-    schemes: Vec<SignatureScheme>,
+    roots: Arc<rustls::RootCertStore>,
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 enum ServerBuildState {
@@ -321,16 +321,21 @@ struct ClientVerifierCache {
     cell: Arc<ClientBuildCell>,
 }
 
-fn build_server_verifier(
-    roots: Arc<rustls::RootCertStore>,
-) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>> {
-    let v = rustls::client::WebPkiServerVerifier::builder(roots)
-        .build()
-        .map_err(|e| Error::VerifierBuilder(format!("{e:?}")))?;
+fn current_supported_algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
+    crate::crypto::supported_algorithms()
+}
 
-    let v: Arc<dyn rustls::client::danger::ServerCertVerifier> = v;
+fn build_server_verifier(roots: Arc<rustls::RootCertStore>) -> Result<ServerVerifierCacheValue> {
+    if roots.is_empty() {
+        return Err(Error::VerifierBuilder(
+            "no root trust anchors were provided".into(),
+        ));
+    }
 
-    Ok(v)
+    Ok(ServerVerifierCacheValue {
+        roots,
+        supported_algs: current_supported_algorithms(),
+    })
 }
 
 fn build_client_verifier(
@@ -377,7 +382,7 @@ impl SpiffeServerCertVerifier {
     fn get_or_build_inner(
         &self,
         trust_domain: &spiffe::TrustDomain,
-    ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>> {
+    ) -> Result<ServerVerifierCacheValue> {
         let snap = self.provider.current_material();
         let r#gen = snap.generation;
 
@@ -419,7 +424,7 @@ impl SpiffeServerCertVerifier {
                 .map_err(|()| Error::Internal("server verifier cache mutex poisoned".into()))?;
 
             match &*guard {
-                ServerBuildState::Ready(v) => return Ok(Arc::clone(&v.verifier)),
+                ServerBuildState::Ready(v) => return Ok(v.clone()),
 
                 ServerBuildState::Empty => {
                     // Become the single builder (no race window).
@@ -441,14 +446,13 @@ impl SpiffeServerCertVerifier {
                         }
                     };
 
-                    let schemes = verifier.supported_verify_schemes();
-                    let value = ServerVerifierCacheValue { verifier, schemes };
+                    let value = verifier;
 
                     // Publish success and wake waiters.
                     let mut g = lock_mutex(&cell.state).map_err(|()| {
                         Error::Internal("server verifier cache mutex poisoned".into())
                     })?;
-                    let verifier = Arc::clone(&value.verifier);
+                    let verifier = value.clone();
                     *g = ServerBuildState::Ready(value);
                     drop(g);
                     cell.cv.notify_all();
@@ -481,13 +485,13 @@ impl SpiffeServerCertVerifier {
         if let Some(cell) = cell {
             if let Ok(guard) = lock_mutex(&cell.state) {
                 if let ServerBuildState::Ready(v) = &*guard {
-                    return v.schemes.clone();
+                    return v.supported_algs.supported_schemes();
                 }
             }
         }
 
         match self.get_or_build_inner(trust_domain) {
-            Ok(v) => v.supported_verify_schemes(),
+            Ok(v) => v.supported_algs.supported_schemes(),
             Err(e) => {
                 debug!(
                 "failed to build server verifier for trust domain {trust_domain}: {e}; returning empty schemes (handshake will fail)");
@@ -508,7 +512,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
+        _server_name: &ServerName<'_>,
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
@@ -526,9 +530,23 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         // Step 3: Get or build verifier for this trust domain
         let inner = self.get_or_build_inner(trust_domain).map_err(other_err)?;
 
-        // Step 4: Verify certificate chain cryptographically
-        let ok =
-            inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        // Step 4: Verify the certificate chain cryptographically. In SPIFFE mode, the workload
+        // identity is the URI SAN and authorization is based on the extracted SPIFFE ID below, so
+        // a DNS/IP server name mismatch should not fail the handshake.
+        let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &parsed,
+            inner.roots.as_ref(),
+            intermediates,
+            now,
+            inner.supported_algs.all,
+        )?;
+
+        if !ocsp_response.is_empty() {
+            debug!("unvalidated OCSP response received during SPIFFE server verification");
+        }
+
+        let ok = rustls::client::danger::ServerCertVerified::assertion();
 
         // Step 5: Apply authorization (only after cryptographic verification succeeds)
         if !self.authorizer.authorize(&spiffe_id) {
@@ -549,7 +567,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             extract_spiffe_id_with_cache(cert, Some(&self.parse_cache)).map_err(other_err)?;
         let trust_domain = spiffe_id.trust_domain();
         let inner = self.get_or_build_inner(trust_domain).map_err(other_err)?;
-        inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &inner.supported_algs)
     }
 
     fn verify_tls13_signature(
@@ -563,7 +581,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             extract_spiffe_id_with_cache(cert, Some(&self.parse_cache)).map_err(other_err)?;
         let trust_domain = spiffe_id.trust_domain();
         let inner = self.get_or_build_inner(trust_domain).map_err(other_err)?;
-        inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &inner.supported_algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -577,8 +595,9 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             &self.policy,
             |td| self.supported_schemes_cached(td),
             |_td, roots| {
-                let verifier = build_server_verifier(roots)?;
-                Ok(verifier.supported_verify_schemes())
+                Ok(build_server_verifier(roots)?
+                    .supported_algs
+                    .supported_schemes())
             },
         )
     }
@@ -1040,6 +1059,10 @@ mod tests {
         ServerName::try_from("example.org").unwrap()
     }
 
+    fn server_name_localhost_ip() -> ServerName<'static> {
+        ServerName::try_from("127.0.0.1").unwrap()
+    }
+
     fn assert_other_downcasts_to_error(err: &rustls::Error) -> &Error {
         match err {
             rustls::Error::Other(other) => {
@@ -1122,6 +1145,27 @@ mod tests {
                 &cert_with_spiffe(),
                 &[],
                 &server_name_example_org(),
+                &[],
+                UnixTime::now(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn server_verifier_accepts_authorized_spiffe_id_when_server_name_mismatches() {
+        ensure_provider();
+
+        let verifier = SpiffeServerCertVerifier::new(
+            static_provider_example_org(1),
+            |id: &SpiffeId| id.to_string() == "spiffe://example.org/service",
+            TrustDomainPolicy::AnyInBundleSet,
+        );
+
+        let _: rustls::client::danger::ServerCertVerified = verifier
+            .verify_server_cert(
+                &cert_with_spiffe(),
+                &[],
+                &server_name_localhost_ip(),
                 &[],
                 UnixTime::now(),
             )

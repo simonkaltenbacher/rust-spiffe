@@ -13,6 +13,10 @@ pub(crate) fn ensure_crypto_provider_installed() {
     });
 }
 
+pub(crate) fn supported_algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
+    crypto_provider().signature_verification_algorithms
+}
+
 #[cfg(feature = "ring")]
 fn crypto_provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
